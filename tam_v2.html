@@ -133,6 +133,27 @@ button.calc-btn:hover { background: #1e8449; }
 /* 결과 테이블 스크롤 */
 #resultArea { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
+/* 편집 모드 */
+.edit-mode-btn { padding: 7px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: bold; }
+.edit-mode-btn.off { background: #e67e22; color: white; }
+.edit-mode-btn.off:hover { background: #d35400; }
+.edit-mode-btn.on  { background: #27ae60; color: white; }
+.edit-mode-btn.on:hover  { background: #1e8449; }
+.edit-chip {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: #2a6dd9; color: white; border-radius: 6px;
+  padding: 3px 10px; margin: 2px 3px; height: 28px;
+  font-size: 13px; font-weight: bold;
+  cursor: grab; user-select: none;
+  transition: opacity .15s, box-shadow .1s;
+}
+.edit-chip:hover { background: #1a5dc9; box-shadow: 0 2px 6px rgba(0,0,0,.25); }
+.edit-chip.dragging { opacity: .3; cursor: grabbing; }
+tr.drag-over > td { background-color: #d6eaff !important; outline: 2px dashed #4a90e2; }
+.pt-chips-cell { text-align: left !important; padding: 5px 7px !important; }
+.unassigned-row td { background: #f5f5f5 !important; color: #888; font-style: italic; }
+.empty-region { font-size: 12px; color: #bbb; }
+
 /* 모바일 */
 @media (max-width: 640px) {
   body { margin: 10px 8px; }
@@ -226,7 +247,10 @@ button.calc-btn:hover { background: #1e8449; }
 
   <!-- 결과 -->
   <div class="card" id="resultCard" style="display:none">
-    <h2>배치 결과</h2>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+      <h2 style="margin:0">배치 결과</h2>
+      <button class="edit-mode-btn off" id="editModeBtn" onclick="toggleEditMode()">✏ 편집 모드</button>
+    </div>
     <div id="resultSummary" class="result-summary"></div>
     <div id="resultArea"></div>
   </div>
@@ -550,11 +574,173 @@ function doOptimize(pool0, continents, finalContName, finalSlot) {
   return { results, pool };
 }
 
+// ── 편집 모드 ─────────────────────────────────────────
+let editResults = [];
+let isEditMode = false;
+let lastPool0 = [];
+let dragInfo = null;
+
+function calcRegionGrade(picked, reqList, hourlyList) {
+  const sum = picked.reduce((a, b) => a + b, 0);
+  if (picked.length === 0) return { grade: 'none', hourly: 0, req: 0, sum: 0 };
+  for (let gi = 0; gi < reqList.length; gi++) {
+    if (sum >= reqList[gi]) return { grade: GRADES[gi], hourly: hourlyList[gi], req: reqList[gi], sum };
+  }
+  return { grade: 'D', hourly: hourlyList[hourlyList.length - 1], req: reqList[reqList.length - 1], sum };
+}
+
+function buildEditResults(results, continents, finalContName, finalRegionSlot, remainingPool) {
+  editResults = [];
+  const printOrder = ['중앙','서부','동부','남부','천계'];
+  for (const name of printOrder) {
+    const res = results[name];
+    if (!res || !res.length) continue;
+    const cont = CONTINENTS_BASE.find(c => c.name === name);
+    const contDef = continents.find(c => c.name === name);
+    [...res].reverse().forEach((r, i) => {
+      const regionNum = i + 1;
+      const isFinalSlotRegion = name === finalContName && regionNum === contDef.regions;
+      editResults.push({
+        displayName: `${name}${regionNum}`,
+        reqList: cont.req,
+        hourlyList: cont.hourly,
+        picked: [...r.picked],
+        maxSlot: isFinalSlotRegion ? finalRegionSlot : SLOT,
+        isUnassigned: false,
+      });
+    });
+  }
+  editResults.push({
+    displayName: '미배치',
+    reqList: [],
+    hourlyList: [],
+    picked: [...remainingPool].sort((a, b) => b - a),
+    maxSlot: Infinity,
+    isUnassigned: true,
+  });
+}
+
+function renderResults() {
+  const totalPts = lastPool0.reduce((a, b) => a + b, 0);
+  let html = '<table><thead><tr><th>지역</th><th>배치 모험가 포인트</th><th>인원</th><th>합계</th><th>낭비</th><th>등급</th><th>시간당 금화</th></tr></thead><tbody>';
+  let totalHourly = 0, totalWaste = 0;
+
+  editResults.forEach((r, idx) => {
+    if (r.isUnassigned && !isEditMode) return;
+
+    let rowClass, gradeDisp, hourlyDisp, wasteDisp, calcSum;
+    if (r.isUnassigned) {
+      calcSum = r.picked.reduce((a, b) => a + b, 0);
+      rowClass = 'unassigned-row';
+      gradeDisp = '-'; hourlyDisp = '-'; wasteDisp = '-';
+    } else {
+      const calc = calcRegionGrade(r.picked, r.reqList, r.hourlyList);
+      calcSum = calc.sum;
+      const waste = calcSum > 0 ? Math.max(0, calcSum - calc.req) : 0;
+      totalHourly += calc.hourly;
+      totalWaste += waste;
+      rowClass = `grade-${calc.grade}`;
+      gradeDisp = calc.grade;
+      hourlyDisp = calc.hourly.toLocaleString();
+      wasteDisp = waste;
+    }
+
+    let ptsCell;
+    if (isEditMode) {
+      const chips = r.picked.map((pt, pi) =>
+        `<span class="edit-chip" draggable="true" ondragstart="onChipDragStart(event,${idx},${pi})" ondragend="onChipDragEnd(event)">${pt}pt</span>`
+      ).join('');
+      ptsCell = `<td class="pt-chips-cell">${chips || '<span class="empty-region">-</span>'}</td>`;
+    } else {
+      ptsCell = `<td>${r.picked.join(', ') || '-'}</td>`;
+    }
+
+    const rowDrop = isEditMode
+      ? `ondragover="onRowDragOver(event)" ondrop="onRowDrop(event,${idx})" ondragleave="onRowDragLeave(event)"`
+      : '';
+
+    html += `<tr class="${rowClass}" ${rowDrop}><td>${r.displayName}</td>${ptsCell}<td>${r.picked.length}</td><td>${calcSum}</td><td>${wasteDisp}</td><td>${gradeDisp}</td><td>${hourlyDisp}</td></tr>`;
+  });
+
+  html += '</tbody></table>';
+
+  const remainingCount = editResults.find(r => r.isUnassigned)?.picked.length ?? 0;
+  document.getElementById('resultArea').innerHTML = html;
+  document.getElementById('resultSummary').innerHTML =
+    `총 모험가: <b>${lastPool0.length}명</b> &nbsp;·&nbsp; 총 포인트: <b>${totalPts.toLocaleString()}</b> &nbsp;·&nbsp; 남은 모험가: <b>${remainingCount}명</b> &nbsp;·&nbsp; 총 낭비: <b>${totalWaste}pt</b><br>
+     총 시간당 금화: <b style="font-size:20px;color:#c40">${totalHourly.toLocaleString()}</b>`;
+}
+
+function toggleEditMode() {
+  if (isEditMode) {
+    const overSlot = editResults.filter(r => !r.isUnassigned && r.picked.length > r.maxSlot);
+    if (overSlot.length > 0) {
+      const msg = overSlot.map(r => `${r.displayName}: ${r.picked.length}명 (최대 ${r.maxSlot}명)`).join('\n');
+      alert(`슬롯 초과 지역이 있습니다:\n${msg}`);
+      return;
+    }
+  }
+  isEditMode = !isEditMode;
+  const btn = document.getElementById('editModeBtn');
+  if (isEditMode) {
+    btn.textContent = '✔ 편집 완료';
+    btn.className = 'edit-mode-btn on';
+  } else {
+    btn.textContent = '✏ 편집 모드';
+    btn.className = 'edit-mode-btn off';
+  }
+  renderResults();
+}
+
+function onChipDragStart(event, regionIdx, pointIdx) {
+  dragInfo = { regionIdx, pointIdx };
+  event.dataTransfer.effectAllowed = 'move';
+  event.currentTarget.classList.add('dragging');
+}
+
+function onChipDragEnd(event) {
+  event.currentTarget.classList.remove('dragging');
+}
+
+function onRowDragOver(event) {
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  event.currentTarget.classList.add('drag-over');
+}
+
+function onRowDragLeave(event) {
+  if (!event.currentTarget.contains(event.relatedTarget)) {
+    event.currentTarget.classList.remove('drag-over');
+  }
+}
+
+function onRowDrop(event, targetIdx) {
+  event.preventDefault();
+  event.currentTarget.classList.remove('drag-over');
+  if (!dragInfo) return;
+  const { regionIdx: srcIdx, pointIdx } = dragInfo;
+  dragInfo = null;
+  if (srcIdx === targetIdx) return;
+
+  const src = editResults[srcIdx];
+  const tgt = editResults[targetIdx];
+
+  const pt = src.picked.splice(pointIdx, 1)[0];
+  tgt.picked.push(pt);
+  tgt.picked.sort((a, b) => b - a);
+  renderResults();
+}
+
 function runOptimize() {
   document.getElementById('error').textContent = '';
+  isEditMode = false;
+  const editBtn = document.getElementById('editModeBtn');
+  if (editBtn) { editBtn.textContent = '✏ 편집 모드'; editBtn.className = 'edit-mode-btn off'; }
+
   try {
     const pool0 = buildPool();
     if (pool0.length === 0) throw new Error('모험가를 1명 이상 선택해주세요.');
+    lastPool0 = pool0;
 
     const maxRegion = document.getElementById('maxRegion').value;
     localStorage.setItem('tam_maxRegion', maxRegion);
@@ -573,30 +759,11 @@ function runOptimize() {
       return { ...c, regions };
     });
 
-    let { results, pool } = doOptimize(pool0, continents, maxContName, finalRegionSlot);
-
-    const printOrder = ['중앙','서부','동부','남부','천계'];
-    let html = '<table><thead><tr><th>지역</th><th>배치 모험가 포인트</th><th>인원</th><th>합계</th><th>낭비</th><th>등급</th><th>시간당 금화</th></tr></thead><tbody>';
-    let totalHourly = 0, totalWaste = 0;
-
-    for (const name of printOrder) {
-      const res = results[name];
-      if (!res || !res.length) continue;
-      [...res].reverse().forEach((r, i) => {
-        const sum = r.picked.reduce((a,b) => a+b, 0);
-        const waste = sum > 0 ? sum - r.req : 0;
-        totalHourly += r.hourly;
-        totalWaste += waste;
-        html += `<tr class="grade-${r.grade}"><td>${name}${i+1}</td><td>${r.picked.join(', ') || '-'}</td><td>${r.picked.length}</td><td>${sum}</td><td>${waste}</td><td>${r.grade}</td><td>${r.hourly.toLocaleString()}</td></tr>`;
-      });
-    }
-    html += '</tbody></table>';
+    const { results, pool } = doOptimize(pool0, continents, maxContName, finalRegionSlot);
+    buildEditResults(results, continents, maxContName, finalRegionSlot, pool);
 
     document.getElementById('resultCard').style.display = 'block';
-    document.getElementById('resultArea').innerHTML = html;
-    document.getElementById('resultSummary').innerHTML =
-      `총 모험가: <b>${pool0.length}명</b> &nbsp;·&nbsp; 총 포인트: <b>${pool0.reduce((a,b)=>a+b,0).toLocaleString()}</b> &nbsp;·&nbsp; 남은 모험가: <b>${pool.length}명</b> &nbsp;·&nbsp; 총 낭비: <b>${totalWaste}pt</b><br>
-       총 시간당 금화: <b style="font-size:20px;color:#c40">${totalHourly.toLocaleString()}</b>`;
+    renderResults();
     document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth' });
   } catch(e) {
     document.getElementById('error').textContent = '에러: ' + e.message;
